@@ -2118,24 +2118,124 @@ fn test_fork_at_should_return_error_for_invalid_frontiers() {
     assert!(matches!(err, LoroError::NotFoundError(..)));
 }
 
-#[test]
-#[parallel]
-fn test_fork_at_should_return_error_for_shallow_doc() {
+/// Build a shallow doc whose shallow root == the frontiers after "Hello", then
+/// three more single-char edits applied on top (so the shallow oplog holds a
+/// tail of post-root ops). Returns (shallow_doc, root_frontiers).
+fn make_shallow_doc_with_tail() -> (LoroDoc, Frontiers) {
     let doc = LoroDoc::new();
     doc.set_peer_id(1).unwrap();
     doc.get_text("text").insert(0, "Hello").unwrap();
     doc.commit();
-    let shallow_bytes = doc
-        .export(ExportMode::shallow_snapshot(&doc.oplog_frontiers()))
-        .unwrap();
+    let root = doc.oplog_frontiers();
 
+    // Re-import as a shallow doc rooted at `root`, then extend it.
+    let shallow_bytes = doc.export(ExportMode::shallow_snapshot(&root)).unwrap();
     let shallow_doc = LoroDoc::new();
     shallow_doc.import(&shallow_bytes).unwrap();
+    assert!(shallow_doc.is_shallow());
 
+    // Use a fresh, deterministic peer for the post-root tail so the tail ops are
+    // peer 2, counters 0 ("!") and 1 ("?"). The shallow root is peer 1, up to
+    // counter 4 ("Hello").
+    shallow_doc.set_peer_id(2).unwrap();
+    shallow_doc.get_text("text").insert(5, "!").unwrap();
+    shallow_doc.commit();
+    shallow_doc.get_text("text").insert(6, "?").unwrap();
+    shallow_doc.commit();
+    (shallow_doc, root)
+}
+
+#[test]
+#[parallel]
+fn test_fork_at_shallow_root_frontiers() {
+    let (shallow_doc, root) = make_shallow_doc_with_tail();
+    // Forking exactly at the shallow root must succeed and reproduce root state.
+    let forked = shallow_doc.fork_at(&root).unwrap();
+    assert!(forked.is_shallow());
+    assert_eq!(forked.state_frontiers(), root);
+    assert_eq!(
+        forked.get_deep_value().to_json_value(),
+        json!({ "text": "Hello" })
+    );
+}
+
+#[test]
+#[parallel]
+fn test_fork_at_after_shallow_root_frontiers() {
+    let (shallow_doc, _) = make_shallow_doc_with_tail();
+    // The shallow root is peer 1 up to counter 4 ("Hello"). The post-root tail
+    // is peer 2: counter 0 = "!", counter 1 = "?". The frontier after the first
+    // post-root edit ("Hello!") is therefore ID(2, 0) — strictly after the root.
+    let mid = Frontiers::from(ID::new(2, 0));
+    let forked = shallow_doc.fork_at(&mid).unwrap();
+    assert!(forked.is_shallow());
+    assert_eq!(forked.state_frontiers(), mid);
+    assert_eq!(
+        forked.get_deep_value().to_json_value(),
+        json!({ "text": "Hello!" })
+    );
+
+    // Fork at the very latest ("Hello!?").
+    let latest = shallow_doc.oplog_frontiers();
+    let forked_latest = shallow_doc.fork_at(&latest).unwrap();
+    assert_eq!(
+        forked_latest.get_deep_value().to_json_value(),
+        json!({ "text": "Hello!?" })
+    );
+}
+
+#[test]
+#[parallel]
+fn test_fork_at_before_shallow_root_is_error() {
+    let (shallow_doc, _) = make_shallow_doc_with_tail();
+    // The shallow root is peer 1 counter 4. Counter 0 is before it and its
+    // history was trimmed away, so it is unreachable in the shallow oplog.
+    // Forking there is impossible in principle and must fail loudly (never a
+    // silent empty/garbage fork). The trimmed op surfaces as a NotFoundError;
+    // a reachable-but-before-root frontier would surface as
+    // SwitchToVersionBeforeShallowRoot — both are loud, precise rejections.
     let err = shallow_doc
-        .fork_at(&shallow_doc.oplog_frontiers())
+        .fork_at(&Frontiers::from(ID::new(1, 0)))
         .unwrap_err();
-    assert!(matches!(err, LoroError::Unknown(..)));
+    let msg = err.to_string();
+    assert!(
+        matches!(err, LoroError::NotFoundError(..)) || msg.contains("shallow"),
+        "before-root fork_at must fail loudly, got: {msg}"
+    );
+}
+
+#[test]
+#[parallel]
+fn test_fork_at_shallow_round_trip() {
+    let (shallow_doc, _) = make_shallow_doc_with_tail();
+    let latest = shallow_doc.oplog_frontiers();
+    let forked = shallow_doc.fork_at(&latest).unwrap();
+
+    // Round-trip the forked doc through a full snapshot export/import.
+    let bytes = forked.export(ExportMode::snapshot()).unwrap();
+    let reloaded = LoroDoc::new();
+    reloaded.import(&bytes).unwrap();
+    assert_eq!(
+        reloaded.get_deep_value().to_json_value(),
+        json!({ "text": "Hello!?" })
+    );
+
+    // The forked doc must keep evolving: apply a further edit and re-export.
+    forked.get_text("text").insert(7, ".").unwrap();
+    forked.commit();
+    assert_eq!(
+        forked.get_deep_value().to_json_value(),
+        json!({ "text": "Hello!?." })
+    );
+
+    // And the fork's post-root tail must still merge into a peer that shares the
+    // same shallow root (import all updates the fork carries).
+    let update = forked.export(ExportMode::all_updates()).unwrap();
+    shallow_doc.import(&update).unwrap();
+    assert_eq!(
+        shallow_doc.get_deep_value().to_json_value(),
+        json!({ "text": "Hello!?." })
+    );
 }
 
 #[test]

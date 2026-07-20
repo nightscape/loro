@@ -3,7 +3,7 @@ use rle::HasLength;
 use rustc_hash::FxHashSet;
 use std::collections::BTreeSet;
 
-use loro_common::{ContainerID, ContainerType, LoroEncodeError, LoroError, ID};
+use loro_common::{ContainerID, ContainerType, LoroEncodeError, ID};
 
 use crate::{
     container::{idx::ContainerIdx, list::list_op::InnerListOp},
@@ -472,29 +472,18 @@ pub(crate) fn encode_snapshot_at<W: std::io::Write>(
     let result = 'block: {
         let oplog = doc.oplog().lock();
         let mut state = doc.app_state().lock();
-        let is_shallow = state.store.shallow_root_store().is_some();
-        if is_shallow {
-            break 'block Err(LoroEncodeError::from(LoroError::NotImplemented(
-                "fork_at on shallow docs",
-            )));
-        }
 
         if state.is_in_txn() {
             break 'block Err(LoroEncodeError::internal(
                 "encode_snapshot_at: state is unexpectedly still in a transaction",
             ));
         }
-        let Some(oplog_bytes) = oplog.fork_changes_up_to(frontiers) else {
-            break 'block Err(LoroEncodeError::FrontiersNotFound(format!(
-                "frontiers: {:?} when export in SnapshotAt mode",
-                frontiers
-            )));
-        };
 
-        if oplog.is_shallow() {
+        let is_shallow = state.store.shallow_root_store().is_some();
+        if is_shallow {
             let Some(shallow_root_frontiers) = state.store.shallow_root_frontiers() else {
                 break 'block Err(LoroEncodeError::internal(
-                    "encode_snapshot_at: shallow oplog is missing shallow root frontiers",
+                    "encode_snapshot_at: shallow state store is missing shallow root frontiers",
                 ));
             };
             if oplog.shallow_since_frontiers() != shallow_root_frontiers {
@@ -502,6 +491,10 @@ pub(crate) fn encode_snapshot_at<W: std::io::Write>(
                     "encode_snapshot_at: shallow root frontiers are inconsistent",
                 ));
             }
+        } else if oplog.is_shallow() {
+            break 'block Err(LoroEncodeError::internal(
+                "encode_snapshot_at: oplog is shallow but the state store has no shallow root",
+            ));
         }
 
         let alive_containers = state.ensure_all_alive_containers()?;
@@ -509,19 +502,95 @@ pub(crate) fn encode_snapshot_at<W: std::io::Write>(
             break 'block Err(LoroEncodeError::UnknownContainer);
         }
 
-        let alive_c_bytes = alive_indices_to_bytes(&state, &alive_containers);
+        let mut alive_c_bytes = alive_indices_to_bytes(&state, &alive_containers);
         state.store.flush();
-        let state_kv = state.store.get_kv_clone();
-        state_kv.retain_keys(&alive_c_bytes);
-        let bytes = state_kv.export();
-        _encode_snapshot(
-            &Snapshot {
+
+        let snapshot = if is_shallow {
+            // Shallow fork: ship the doc's existing shallow-root base state plus
+            // the op tail and state delta needed to reach `frontiers`. The op
+            // tail runs from the shallow root to `frontiers` and must be encoded
+            // as a *shallow* change store (start version recorded), so we use the
+            // range export rather than `fork_changes_up_to` — the latter uses
+            // `encode_all`, which asserts a complete history and would panic on a
+            // shallow oplog. `frontiers` is guaranteed at/after the shallow root:
+            // the `_checkout_without_emitting` above already rejected anything
+            // before it with `SwitchToVersionBeforeShallowRoot`.
+            let start_from = oplog.shallow_since_frontiers().clone();
+            let mut start_vv =
+                match frontiers_to_vv_for_export(&oplog, &start_from, "encode_snapshot_at") {
+                    Ok(vv) => vv,
+                    Err(e) => break 'block Err(e),
+                };
+            for id in start_from.iter() {
+                // Include the ops at the shallow root itself in the start version.
+                start_vv.insert(id.peer, id.counter);
+            }
+            let to_vv = match frontiers_to_vv_for_export(&oplog, frontiers, "encode_snapshot_at") {
+                Ok(vv) => vv,
+                Err(e) => break 'block Err(e),
+            };
+            let oplog_bytes =
+                oplog.export_change_store_in_range(&start_vv, &start_from, &to_vv, frontiers);
+
+            let Some((shallow_root_state_bytes, shallow_root_kv)) =
+                state.store.shallow_root_state_for_export()
+            else {
+                break 'block Err(LoroEncodeError::internal(
+                    "encode_snapshot_at: shallow doc is missing its shallow root store",
+                ));
+            };
+
+            // Containers created after the shallow root are not part of the root
+            // base state and must be retained in the delta.
+            for cid in state.store.iter_all_container_ids() {
+                if let ContainerID::Normal { peer, counter, .. } = cid {
+                    if !start_from.contains(&ID::new(peer, counter)) {
+                        alive_c_bytes.insert(cid.to_bytes());
+                    }
+                } else {
+                    alive_c_bytes.insert(cid.to_bytes());
+                }
+            }
+
+            let state_kv = state.store.get_kv_clone();
+            state_kv.remove_same(&shallow_root_kv);
+            state_kv.retain_keys(&alive_c_bytes);
+
+            // The stored shallow-root bytes may predate dead-style redaction,
+            // so re-run it before reuse, as `export_shallow_snapshot_inner` does.
+            let shallow_root_state_bytes =
+                if redact_export_states(&shallow_root_kv, Some(&state_kv))? {
+                    shallow_root_kv.insert(FRONTIERS_KEY, start_from.encode().into());
+                    shallow_root_kv.export()
+                } else {
+                    shallow_root_state_bytes
+                };
+
+            Snapshot {
                 oplog_bytes,
-                state_bytes: Some(bytes),
+                state_bytes: Some(state_kv.export()),
+                shallow_root_state_bytes,
+            }
+        } else {
+            // Full doc: `fork_changes_up_to` starts from an empty version and
+            // carries the entire history up to `frontiers`. It returns `None`
+            // only when `frontiers` is unreachable in the oplog.
+            let Some(oplog_bytes) = oplog.fork_changes_up_to(frontiers) else {
+                break 'block Err(LoroEncodeError::FrontiersNotFound(format!(
+                    "frontiers: {:?} when export in SnapshotAt mode",
+                    frontiers
+                )));
+            };
+            let state_kv = state.store.get_kv_clone();
+            state_kv.retain_keys(&alive_c_bytes);
+            Snapshot {
+                oplog_bytes,
+                state_bytes: Some(state_kv.export()),
                 shallow_root_state_bytes: Bytes::new(),
-            },
-            w,
-        );
+            }
+        };
+
+        _encode_snapshot(&snapshot, w);
 
         Ok(())
     };
