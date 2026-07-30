@@ -593,7 +593,7 @@ impl Transaction {
 
         let mut oplog = doc.oplog.lock();
         let mut state = doc.state.lock();
-        if state.is_deleted(container) {
+        if state.is_deleted(container) && !state.is_purging(container) {
             return Err(LoroError::ContainerDeleted {
                 container: Box::new(state.arena.idx_to_id(container).unwrap()),
             });

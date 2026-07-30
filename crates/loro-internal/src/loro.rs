@@ -2455,34 +2455,71 @@ impl LoroDoc {
         })
     }
 
-    pub fn delete_root_container(&self, cid: ContainerID) {
+    /// Purge a root container: empty it with real deletion ops and hide it from the
+    /// document value.
+    ///
+    /// The container may already be unreachable — a mergeable root whose owning tree node
+    /// was deleted still holds its full content in state and in every export. The purge
+    /// ops are ordinary CRDT ops, so a peer that never purges converges on the same
+    /// (empty) value once it imports them; only the encoded bytes differ.
+    ///
+    /// Errors if `cid` is not a root container, if the document has no such container, or
+    /// if emptying it fails.
+    pub fn delete_root_container(&self, cid: ContainerID) -> LoroResult<()> {
         if !cid.is_root() {
-            return;
+            return Err(LoroError::NotFoundError(
+                format!("delete_root_container expects a root container, got {cid:?}").into(),
+            ));
         }
 
         // Do not treat "not in arena" as non-existence; consult state/kv
         if !self.has_container(&cid) {
-            return;
+            return Err(LoroError::NotFoundError(
+                format!("delete_root_container: no such container {cid:?}").into(),
+            ));
         }
 
         let Some(h) = self.get_handler(cid.clone()) else {
-            return;
+            return Err(LoroError::NotFoundError(
+                format!("delete_root_container: no handler for {cid:?}").into(),
+            ));
         };
 
         self.config
             .deleted_root_containers
             .lock()
             .insert(cid.clone());
-        if let Err(e) = h.clear() {
+
+        let idx = self.arena.register_container(&cid);
+        let _purge = PurgeGuard::new(self, idx);
+        h.clear().inspect_err(|_| {
             self.config.deleted_root_containers.lock().remove(&cid);
-            eprintln!("Failed to clear handler: {:?}", e);
-        }
+        })
     }
 
     pub fn set_hide_empty_root_containers(&self, hide: bool) {
         self.config
             .hide_empty_root_containers
             .store(hide, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Scopes the purge exemption to one container and one call, so an early return or a
+/// panic inside `clear()` cannot leave the document accepting edits on dead containers.
+struct PurgeGuard<'a> {
+    doc: &'a LoroDoc,
+}
+
+impl<'a> PurgeGuard<'a> {
+    fn new(doc: &'a LoroDoc, idx: ContainerIdx) -> Self {
+        doc.state.lock().set_purging_container(Some(idx));
+        Self { doc }
+    }
+}
+
+impl Drop for PurgeGuard<'_> {
+    fn drop(&mut self) {
+        self.doc.state.lock().set_purging_container(None);
     }
 }
 

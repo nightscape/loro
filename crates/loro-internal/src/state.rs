@@ -172,6 +172,12 @@ pub struct DocState {
 
     dead_containers_cache: DeadContainersCache,
     alive_containers_cache: Option<AliveContainersCache>,
+
+    /// While `LoroDoc::delete_root_container` purges a container that is already
+    /// unreachable (e.g. a mergeable root whose owning tree node was deleted), local ops
+    /// on it must be admitted — they are the deletion ops that empty it. Only the single
+    /// container being purged is exempted, and only for the duration of the purge.
+    purging_container: Option<ContainerIdx>,
 }
 
 struct AliveContainersCache {
@@ -479,6 +485,7 @@ impl DocState {
                 event_recorder: Default::default(),
                 dead_containers_cache: Default::default(),
                 alive_containers_cache: None,
+                purging_container: None,
             },
             crate::lock::LockKind::DocState,
         ))
@@ -504,7 +511,18 @@ impl DocState {
             event_recorder: Default::default(),
             dead_containers_cache: Default::default(),
             alive_containers_cache: None,
+            purging_container: None,
         }))
+    }
+
+    /// Exempt `idx` from the "no local ops on a deleted container" rule while a purge
+    /// empties it. See [`Self::purging_container`].
+    pub(crate) fn set_purging_container(&mut self, idx: Option<ContainerIdx>) {
+        self.purging_container = idx;
+    }
+
+    pub(crate) fn is_purging(&self, idx: ContainerIdx) -> bool {
+        self.purging_container == Some(idx)
     }
 
     pub fn start_recording(&mut self) {

@@ -1656,11 +1656,20 @@ impl LoroDoc {
     ///
     /// When a root container is empty and hidden:
     /// - It won't show up in `get_deep_value()` results
-    /// - It won't be included in document snapshots
+    /// - It won't be included in shallow snapshots
     ///
-    /// Only works on root containers (containers without parents).
-    pub fn delete_root_container(&self, cid: ContainerID) {
-        self.doc.delete_root_container(cid);
+    /// This also works on a root container that is already unreachable, such as a
+    /// mergeable root whose owning tree node was deleted — that content otherwise
+    /// survives in state and in every export indefinitely.
+    ///
+    /// Note that a full `ExportMode::Snapshot` still carries the original insert ops in
+    /// its history; only shallow snapshots (and peers importing from them) drop the
+    /// purged bytes.
+    ///
+    /// Only works on root containers (containers without parents). Errors if `cid` is not
+    /// a root container, is unknown to the document, or cannot be emptied.
+    pub fn delete_root_container(&self, cid: ContainerID) -> LoroResult<()> {
+        self.doc.delete_root_container(cid)
     }
 
     /// Set whether to hide empty root containers.
