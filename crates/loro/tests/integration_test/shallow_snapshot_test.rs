@@ -771,3 +771,49 @@ fn shallow_snapshot_redacts_dead_styles_for_all_non_both_expands() -> anyhow::Re
     }
     Ok(())
 }
+
+/// `fork_at` on a shallow doc reuses the doc's stored shallow-root state bytes
+/// instead of rebuilding them from history, and re-runs dead-style redaction on
+/// them (`encode_snapshot_at` in `shallow_snapshot.rs`). A style value that was
+/// already dead at the shallow root must therefore be absent from the fork —
+/// from its export bytes and from the fork's own root state.
+///
+/// A style that is still ALIVE at the shallow root is a different case and is
+/// deliberately retained: the fork is rooted at the same version, and
+/// `shallow_snapshot_keeps_style_alive_at_root_and_redacts_on_reexport` pins
+/// that for the shallow-snapshot path.
+#[test]
+fn fork_at_on_a_shallow_doc_carries_no_dead_style_values() -> anyhow::Result<()> {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1)?;
+    let text = doc.get_text("text");
+    text.insert(0, "secret")?;
+    text.mark(0..6, "comment", LoroValue::String("FORK-DEAD-88".into()))?;
+    doc.commit();
+    text.delete(0, 6)?;
+    doc.commit();
+    // The shallow root: the style's anchors are both gone here.
+    let root_frontiers = doc.oplog_frontiers();
+    text.insert(0, "later")?;
+    doc.commit();
+
+    let shallow = LoroDoc::new();
+    shallow.import(&doc.export(ExportMode::shallow_snapshot(&root_frontiers))?)?;
+    assert!(shallow.is_shallow());
+
+    let tip = shallow.oplog_frontiers();
+    assert!(!bytes_contain(
+        &shallow.export(ExportMode::snapshot_at(&tip))?,
+        "FORK-DEAD-88"
+    ));
+
+    let forked = shallow.fork_at(&tip)?;
+    assert_eq!(forked.get_text("text").to_string(), "later");
+    forked.checkout(&forked.shallow_since_frontiers())?;
+    assert!(
+        !format!("{:?}", forked.get_text("text").get_richtext_value())
+            .contains("FORK-DEAD-88"),
+        "dead style value survived into the fork's shallow-root state"
+    );
+    Ok(())
+}
