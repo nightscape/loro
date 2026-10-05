@@ -208,6 +208,7 @@ struct UndoManagerInner {
     merge_interval_in_ms: i64,
     max_stack_size: usize,
     exclude_origin_prefixes: Vec<Box<str>>,
+    include_origin_prefixes: Vec<Box<str>>,
     last_popped_selection: Option<Vec<CursorWithPos>>,
     on_push: Option<OnPush>,
     on_pop: Option<OnPop>,
@@ -225,6 +226,7 @@ impl std::fmt::Debug for UndoManagerInner {
             .field("merge_interval", &self.merge_interval_in_ms)
             .field("max_stack_size", &self.max_stack_size)
             .field("exclude_origin_prefixes", &self.exclude_origin_prefixes)
+            .field("include_origin_prefixes", &self.include_origin_prefixes)
             .field("group", &self.group)
             .finish()
     }
@@ -518,6 +520,7 @@ impl UndoManagerInner {
             last_undo_time: 0,
             max_stack_size: usize::MAX,
             exclude_origin_prefixes: vec![],
+            include_origin_prefixes: vec![],
             last_popped_selection: None,
             on_pop: None,
             on_push: None,
@@ -629,11 +632,19 @@ impl UndoManager {
                     .find(|x| x.peer == peer_clone.load(std::sync::atomic::Ordering::Relaxed))
                 {
                     let is_paused = lock.borrow().paused;
-                    let should_exclude = lock
-                        .borrow()
-                        .exclude_origin_prefixes
-                        .iter()
-                        .any(|x| event.event_meta.origin.starts_with(&**x));
+                    let should_exclude = {
+                        let inner = lock.borrow();
+                        let origin = &event.event_meta.origin;
+                        inner
+                            .exclude_origin_prefixes
+                            .iter()
+                            .any(|x| origin.starts_with(&**x))
+                            || (!inner.include_origin_prefixes.is_empty()
+                                && !inner
+                                    .include_origin_prefixes
+                                    .iter()
+                                    .any(|x| origin.starts_with(&**x)))
+                    };
                     if is_paused || should_exclude {
                         // Paused and excluded-origin edits are not recorded as
                         // undo steps, but their effects must be composed into
@@ -748,6 +759,14 @@ impl UndoManager {
             .lock()
             .borrow_mut()
             .exclude_origin_prefixes
+            .push(prefix.into());
+    }
+
+    pub fn add_include_origin_prefix(&self, prefix: &str) {
+        self.inner
+            .lock()
+            .borrow_mut()
+            .include_origin_prefixes
             .push(prefix.into());
     }
 

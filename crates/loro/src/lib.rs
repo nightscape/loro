@@ -3913,6 +3913,13 @@ impl UndoManager {
         self.0.add_exclude_origin_prefix(prefix)
     }
 
+    /// Once any include prefix is set, a local event whose origin matches none
+    /// of them is not recorded in the undo stack, as if it were excluded.
+    /// Exclusion still applies to an event that matches an include prefix.
+    pub fn add_include_origin_prefix(&mut self, prefix: &str) {
+        self.0.add_include_origin_prefix(prefix)
+    }
+
     /// Set the maximum number of undo steps. The default value is 100.
     pub fn set_max_undo_steps(&mut self, size: usize) {
         self.0.set_max_undo_steps(size)

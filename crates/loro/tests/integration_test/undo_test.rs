@@ -1596,6 +1596,36 @@ fn exclude_certain_local_ops_from_undo() -> anyhow::Result<()> {
 }
 
 #[test]
+fn include_only_certain_local_ops_in_undo() -> anyhow::Result<()> {
+    let doc = LoroDoc::new();
+    let mut first = UndoManager::new(&doc);
+    first.add_include_origin_prefix("batch.1");
+    let mut second = UndoManager::new(&doc);
+    second.add_include_origin_prefix("batch.2");
+    second.add_exclude_origin_prefix("batch.2.skip");
+    let text = doc.get_text("text");
+    text.insert(0, "123")?;
+    doc.commit();
+    text.insert(0, "a")?;
+    doc.commit_with(CommitOptions::new().origin("batch.1"));
+    text.insert(0, "b")?;
+    doc.commit_with(CommitOptions::new().origin("batch.2"));
+    text.insert(0, "c")?;
+    doc.commit_with(CommitOptions::new().origin("batch.2.skip"));
+    text.insert(0, "d")?; // dcba123
+    doc.commit_with(CommitOptions::new().origin("other"));
+    assert_eq!(first.undo_count(), 1);
+    assert_eq!(second.undo_count(), 1);
+    first.undo()?;
+    assert_eq!(text.to_string(), "dcb123");
+    second.undo()?;
+    assert_eq!(text.to_string(), "dc123");
+    assert!(!first.can_undo());
+    assert!(!second.can_undo());
+    Ok(())
+}
+
+#[test]
 fn should_not_trigger_update_when_undo_ops_depend_on_deleted_container() -> anyhow::Result<()> {
     let doc_a = LoroDoc::new();
     let doc_b = LoroDoc::new();
