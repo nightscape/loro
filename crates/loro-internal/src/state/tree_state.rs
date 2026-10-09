@@ -981,6 +981,28 @@ impl TreeState {
             .flatten()
     }
 
+    /// The index a new child at `node_position` sorts to, or `None` when a
+    /// sibling already holds the same fractional index.
+    pub(crate) fn index_for_unique_position(
+        &self,
+        parent: &TreeParentId,
+        node_position: &NodePosition,
+    ) -> Option<usize> {
+        let Some(children) = self.children.get(parent) else {
+            return Some(0);
+        };
+        let index = match children.get_last_insert_index_by_position(node_position) {
+            Ok(i) | Err(i) => i,
+        };
+        let same = |i: usize| {
+            children
+                .get_node_position_at(i)
+                .is_some_and(|p| p.position == node_position.position)
+        };
+        let taken = (index > 0 && same(index - 1)) || same(index);
+        (!taken).then_some(index)
+    }
+
     pub(crate) fn get_index_by_position(
         &self,
         parent: &TreeParentId,

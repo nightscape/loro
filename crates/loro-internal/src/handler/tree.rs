@@ -21,6 +21,8 @@ use crate::{
 
 use super::{create_handler, Handler, MaybeDetached};
 
+const FRACTIONAL_INDEX_TERMINATOR: u8 = 0x80;
+
 #[derive(Clone)]
 pub struct TreeHandler {
     pub(super) inner: MaybeDetached<TreeInner>,
@@ -431,6 +433,56 @@ impl TreeHandler {
                 a.with_txn(|txn| self.create_with_txn(txn, parent, index, FiIfNotConfigured::Throw))
             }
         }
+    }
+
+    /// Create a node under `parent` at the given fractional index instead of a
+    /// generated one. The sibling order follows `position`. A position that a
+    /// sibling already holds is refused, so the caller's keys stay unique.
+    pub fn create_at_fractional_index(
+        &self,
+        parent: TreeParentId,
+        position: FractionalIndex,
+    ) -> LoroResult<TreeID> {
+        match parent {
+            TreeParentId::Deleted | TreeParentId::Unexist => {
+                return Err(LoroTreeError::InvalidParent.into());
+            }
+            TreeParentId::Node(p) if !self.contains(p) => {
+                return Err(LoroTreeError::TreeNodeParentNotFound(p).into());
+            }
+            _ => {}
+        }
+        // Only a terminated index is guaranteed a generated neighbour on
+        // both sides; without it a later `create_at` between two adopted
+        // nodes can fail.
+        if position.as_bytes().last() != Some(&FRACTIONAL_INDEX_TERMINATOR) {
+            return Err(LoroTreeError::InvalidFractionalIndex(position.to_string()).into());
+        }
+        let MaybeDetached::Attached(a) = &self.inner else {
+            return Err(LoroError::MisuseDetachedContainer {
+                method: "create_at_fractional_index",
+            });
+        };
+        a.with_txn(|txn| {
+            let inner = self.inner.try_attached_state()?;
+            let target = TreeID::from_id(txn.next_id());
+            let node_position = NodePosition {
+                position: position.clone(),
+                idlp: txn.next_idlp(),
+            };
+            let index = a
+                .with_state(|state| {
+                    state
+                        .as_tree_state()
+                        .unwrap()
+                        .index_for_unique_position(&parent, &node_position)
+                })
+                .ok_or_else(|| LoroTreeError::DuplicateFractionalIndex {
+                    parent: parent.tree_id(),
+                    position: position.to_string(),
+                })?;
+            self.create_with_position(inner, txn, target, parent, index, position)
+        })
     }
 
     /// For undo/redo, Specify the TreeID of the created node

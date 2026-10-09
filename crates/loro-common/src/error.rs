@@ -133,6 +133,13 @@ pub enum LoroTreeError {
     FractionalIndexNotEnabled,
     #[error("TreeID {0:?} is deleted or does not exist")]
     TreeNodeDeletedOrNotExist(TreeID),
+    #[error("Fractional index {0} is not well-formed: its last byte must be the terminator 80")]
+    InvalidFractionalIndex(String),
+    #[error("Parent {parent:?} already has a child at fractional index {position}")]
+    DuplicateFractionalIndex {
+        parent: Option<TreeID>,
+        position: String,
+    },
 }
 
 #[non_exhaustive]

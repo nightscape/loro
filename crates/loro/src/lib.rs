@@ -3010,6 +3010,40 @@ impl LoroTree {
         self.handler.create_at(parent.into(), index)
     }
 
+    /// Create a new tree node at the given fractional index and return the [`TreeID`].
+    ///
+    /// The node sorts among its siblings by `position`, like a node whose index
+    /// Loro generated. Use it to adopt order keys minted elsewhere with the same
+    /// algorithm (for example the hex keys that [`LoroTree::fractional_index`]
+    /// returns).
+    ///
+    /// Errors: fractional index not enabled; `position` does not end with the
+    /// terminator byte `0x80`; a sibling already holds `position`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loro::{FractionalIndex, LoroDoc};
+    ///
+    /// let doc = LoroDoc::new();
+    /// let tree = doc.get_tree("tree");
+    /// tree.enable_fractional_index(0);
+    /// let b = tree.create_at_fractional_index(None, FractionalIndex::from_hex_string("8180")).unwrap();
+    /// let a = tree.create_at_fractional_index(None, FractionalIndex::from_hex_string("7F80")).unwrap();
+    /// assert_eq!(tree.roots(), vec![a, b]);
+    /// ```
+    pub fn create_at_fractional_index<T: Into<TreeParentId>>(
+        &self,
+        parent: T,
+        position: FractionalIndex,
+    ) -> LoroResult<TreeID> {
+        if !self.handler.is_fractional_index_enabled() {
+            return Err(LoroTreeError::FractionalIndexNotEnabled.into());
+        }
+        self.handler
+            .create_at_fractional_index(parent.into(), position)
+    }
+
     /// Move the `target` node to be a child of the `parent` node.
     ///
     /// If the `parent` is `None`, the `target` node will be a root.
